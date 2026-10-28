@@ -19,6 +19,9 @@ namespace cuda {
 template <typename CudaT = float>
 __device__ __forceinline__ float SwiGluActivation(float gate, float up, float limit, float alpha, float beta,
                                                   bool round_activation = false) {
+  // `l + beta` with beta == +0.0 turns l == -0.0 into +0.0 and can flip the sign of a zero result, which a
+  // QuickGelu followed by a Mul keeps. -0.0 is the additive identity for every l, so a zero beta adds that.
+  const float bias = beta == 0.0f ? -0.0f : beta;
   float g = gate;
   float l = up;
   if (limit > 0.0f) {
@@ -34,15 +37,15 @@ __device__ __forceinline__ float SwiGluActivation(float gate, float up, float li
     const double activated = wide_g * e / (1.0 + e);
     if (round_activation) {
       // QuickGelu narrows double -> float -> CudaT.
-      return static_cast<float>(static_cast<CudaT>(static_cast<float>(activated))) * (l + beta);
+      return static_cast<float>(static_cast<CudaT>(static_cast<float>(activated))) * (l + bias);
     }
-    return static_cast<float>(activated * (static_cast<double>(l) + static_cast<double>(beta)));
+    return static_cast<float>(activated * (static_cast<double>(l) + static_cast<double>(bias)));
   }
   // Keeps the exponent non-positive without cancelling small negative-input results.
   const float sigmoid = scaled > 0.0f ? 1.0f / (1.0f + expf(-scaled)) : expf(scaled) / (1.0f + expf(scaled));
   float activated = g * sigmoid;
   if (round_activation) activated = static_cast<float>(static_cast<CudaT>(activated));
-  return activated * (l + beta);
+  return activated * (l + bias);
 }
 
 }  // namespace cuda

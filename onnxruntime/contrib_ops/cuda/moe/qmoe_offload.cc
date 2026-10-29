@@ -163,7 +163,13 @@ bool IsStickyCudaContextError(cudaError_t err) noexcept {
 
 inline bool IsInQMoEWarmup() noexcept {
   const char* v = std::getenv("ORT_QMOE_IN_WARMUP");
-  return v != nullptr && v[0] == '1';
+  if (v != nullptr) return v[0] == '1';
+#if defined(_WIN32)
+  char buf[4]{};
+  const DWORD len = GetEnvironmentVariableA("ORT_QMOE_IN_WARMUP", buf, sizeof(buf));
+  if (len > 0 && len < sizeof(buf)) return buf[0] == '1';
+#endif
+  return false;
 }
 
 class StreamDrain final {
@@ -3201,7 +3207,7 @@ void QMoEOffload::InitializeNvfp4Offload(const OpKernelInfo& info) {
   cpu_fp16_boundaries_ = ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_SHARED_CPU_FP16_BOUNDARIES", 0) == 1;
   const bool is_int_bank = int4_bank_mode_ || int3_bank_mode_;
   const int default_stream_rows =
-      ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_SHARED_STREAM_ROWS", is_int_bank ? 2048 : 0);
+      ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_SHARED_STREAM_ROWS", is_int_bank ? 8192 : 0);
   if (v4_planned_mode_ &&
       v4_policy_.cpu_execution == onnxruntime::moe_offload::CpuExecutionMode::kDisabled &&
       resident_slots_ < num_experts_) {
@@ -3327,7 +3333,7 @@ void QMoEOffload::InitializeNvfp4Offload(const OpKernelInfo& info) {
       }
       runner_->setTactic(chosen, chosen);
       const ck::MOEParallelismConfig parallelism;
-      constexpr int kMaxInt4RunnerRoutes = 4096;
+      constexpr int kMaxInt4RunnerRoutes = 2048;
       const int max_exp = std::max({physical_slots_, stream_wave_, 1});
       resident_workspace_bytes_ = runner_->getWorkspaceSize(
           kMaxInt4RunnerRoutes, hidden_size_, inter_size_, max_exp, 1,
@@ -6816,8 +6822,11 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
   const int route_slots = std::max(route_cap, kGroupedMoeMinRows);
   const size_t route_bytes = SafeInt<size_t>(route_slots) * sizeof(int);
   const bool use_int4_runner = (int4_bank_mode_ && runner_ != nullptr);
-  const int wave_route_slots = (nvfp4_mode_ && route_slots > 4096) ? 4096 : route_slots;
-  const int cpu_row_cap = streaming ? std::min(route_cap, (stream_min_rows_ - 1) * num_experts_) : route_cap;
+  const int max_wave_routes = use_int4_runner ? 2048 : 4096;
+  const int wave_route_slots = (nvfp4_mode_ && route_slots > max_wave_routes) ? max_wave_routes : route_slots;
+  const bool stream_no_cpu_tail = streaming && (stream_min_rows_ <= 1 || tile_limit >= 2048);
+  const int eff_min_rows_cap = stream_no_cpu_tail ? 1 : stream_min_rows_;
+  const int cpu_row_cap = streaming ? std::min(route_cap, (eff_min_rows_cap - 1) * num_experts_) : route_cap;
   const size_t contribution_bytes = SafeInt<size_t>(route_cap) * hidden_size_ * elem_size;
   const size_t cpu_row_bytes = SafeInt<size_t>(std::max(cpu_row_cap, 1)) * hidden_size_ * elem_size;
   const size_t resident_row_bytes = SafeInt<size_t>(wave_route_slots) * hidden_size_ * elem_size;
@@ -6836,7 +6845,7 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
   const size_t bias_offset = has_bias ? AddSlab(contribution_bytes, gpu_bytes) : 0;
   const size_t hit_ids_offset = resident ? AddSlab(route_bytes, gpu_bytes) : 0;
   const size_t hit_compact_offset = resident ? AddSlab(route_bytes, gpu_bytes) : 0;
-  const size_t cpu_ids_offset = (resident || streaming) ? AddSlab(route_bytes, gpu_bytes) : 0;
+  const size_t cpu_ids_offset = (!stream_no_cpu_tail && (resident || streaming)) ? AddSlab(route_bytes, gpu_bytes) : 0;
   const size_t permutation_offset =
       ((resident || streaming) && (!nvfp4_mode_ || use_int4_runner))
           ? AddSlab(SafeInt<size_t>(wave_route_slots) * sizeof(int), gpu_bytes)
@@ -6844,7 +6853,7 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
   const size_t gathered_offset = (resident || streaming) ? AddSlab(resident_row_bytes, gpu_bytes) : 0;
   const size_t wave_output_offset = (resident || streaming) ? AddSlab(resident_row_bytes, gpu_bytes) : 0;
   const size_t nvfp4_inter_offset = (nvfp4_mode_ && (resident || streaming)) ? AddSlab(nvfp4_inter_bytes, gpu_bytes) : 0;
-  const size_t cpu_rows_offset = (resident || streaming) ? AddSlab(streaming ? cpu_row_bytes : contribution_bytes, gpu_bytes) : 0;
+  const size_t cpu_rows_offset = (!stream_no_cpu_tail && (resident || streaming)) ? AddSlab(streaming ? cpu_row_bytes : contribution_bytes, gpu_bytes) : 0;
   const size_t workspace_offset =
       ((!nvfp4_mode_ || use_int4_runner) && (resident || streaming))
           ? AddSlab(streaming ? stream_workspace_bytes_ : resident_workspace_bytes_, gpu_bytes)
@@ -6858,11 +6867,11 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
   size_t host_bytes = 0;
   const size_t host_index_offset = AddSlab(route_bytes, host_bytes);
   const size_t host_phase_offset = AddSlab(tile_limit, host_bytes);
-  const size_t host_input_offset = AddSlab(SafeInt<size_t>(tile_limit) * hidden_size_ * elem_size, host_bytes);
-  const size_t host_result_offset = AddSlab(streaming ? cpu_row_bytes : contribution_bytes, host_bytes);
+  const size_t host_input_offset = stream_no_cpu_tail ? 0 : AddSlab(SafeInt<size_t>(tile_limit) * hidden_size_ * elem_size, host_bytes);
+  const size_t host_result_offset = stream_no_cpu_tail ? 0 : AddSlab(streaming ? cpu_row_bytes : contribution_bytes, host_bytes);
   const size_t host_hit_ids_offset = resident ? AddSlab(route_bytes, host_bytes) : 0;
   const size_t host_hit_compact_offset = resident ? AddSlab(route_bytes, host_bytes) : 0;
-  const size_t host_cpu_ids_offset = (resident || streaming) ? AddSlab(route_bytes, host_bytes) : 0;
+  const size_t host_cpu_ids_offset = (!stream_no_cpu_tail && (resident || streaming)) ? AddSlab(route_bytes, host_bytes) : 0;
   const size_t host_stream_ids_offset = streaming ? AddSlab(stream_meta_bytes, host_bytes) : 0;
   const size_t host_stream_compact_offset = streaming ? AddSlab(stream_meta_bytes, host_bytes) : 0;
   const bool int_bank_uses_cache =
@@ -7027,7 +7036,7 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
       return Status::OK();
     }
     if (int4_bank_mode_) {
-      if (use_int4_runner && num_r >= 256 && num_r >= num_exp * 8 && num_r <= wave_route_slots) {
+      if (use_int4_runner && num_r >= 64 && num_r >= num_exp * 4 && num_r <= wave_route_slots) {
         const auto int4_quant = is_bf16_
             ? ck::QuantParams::GroupWise(32, reinterpret_cast<const __nv_bfloat16*>(fc1_s),
                                          reinterpret_cast<const __nv_bfloat16*>(fc2_s))
@@ -7148,7 +7157,8 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
       const int8_t inferred_phase = (rows > async_max_tokens_) ? 0 : 1;
       std::fill_n(host_phases, tile_rows, inferred_phase);
     }
-    if (!(streaming && stream_min_rows_ <= 1)) {
+    const bool tile_no_cpu_tail = stream_no_cpu_tail || (streaming && (stream_min_rows_ <= 1 || tile_rows >= 2048));
+    if (!tile_no_cpu_tail) {
       CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(host_input, static_cast<const uint8_t*>(input->DataRaw()) + activation_start * elem_size,
                                            SafeInt<size_t>(tile_rows) * hidden_size_ * elem_size, cudaMemcpyDeviceToHost, stream));
     }
@@ -7254,7 +7264,7 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
     };
     const char* skip_experts = nullptr;
     int cpu_rows_written = 0;
-    bool cpu_tail_executed = false;
+    bool cpu_tail_executed = tile_no_cpu_tail;
     auto run_cpu_tail_experts = [&]() {
       if (cpu_tail_executed) return;
       cpu_tail_executed = true;
@@ -7274,9 +7284,11 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
       static const bool scale_short_min_rows =
           ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_SCALE_SHORT_STREAM_MIN_ROWS", 0) == 1;
       const int eff_stream_min_rows =
-          ((resident_slots_ == 0 || scale_short_min_rows) && tile_rows < 512 && stream_min_rows_ > 2)
-              ? std::max(2, (stream_min_rows_ * tile_rows + 511) / 512)
-              : stream_min_rows_;
+          tile_no_cpu_tail
+              ? 1
+              : (((resident_slots_ == 0 || scale_short_min_rows) && tile_rows < 512 && stream_min_rows_ > 2)
+                     ? std::max(2, (stream_min_rows_ * tile_rows + 511) / 512)
+                     : stream_min_rows_);
       for (int expert = 0; expert < num_experts_; ++expert) {
         if (static_cast<int>(expert_routes[expert].size()) >= eff_stream_min_rows) {
           stream_list.push_back(expert);
@@ -7735,7 +7747,7 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
         shared.bank_has_gemm[bank_idx] = true;
         meta_offset += std::max(wave_route_cnt, nvfp4_mode_ ? wave_route_cnt : kGroupedMoeMinRows);
         tile_stream_routes += wave_routes;
-        if (!cpu_tail_executed && (wave == 1 || waves == 1)) {
+        if (!cpu_tail_executed && (stage_weight_banks == 1 ? (wave == 0) : (wave == 1 || waves == 1))) {
           static_cast<void>(cudaStreamQuery(shared.copy_stream));
           static_cast<void>(cudaStreamQuery(stream));
           run_cpu_tail_experts();
@@ -7863,7 +7875,8 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
 }
 
 void QMoEOffload::RunAsyncCpu(AsyncTile& tile) const {
-  const bool timed = cpu_timing_ && tile.tile_rows <= std::max(4, async_max_tokens_);
+  const bool in_warmup = IsInQMoEWarmup();
+  const bool timed = cpu_timing_ && !in_warmup && tile.tile_rows <= std::max(4, async_max_tokens_);
   const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   if (timed) {
     const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count();
@@ -7924,7 +7937,6 @@ void QMoEOffload::RunAsyncCpu(AsyncTile& tile) const {
   }
 
   // Pass 2: Record validated routes and classify cold misses on the callback thread (overlapped with GPU GEMV).
-  const bool in_warmup = IsInQMoEWarmup();
   const bool track_resident_scores = (resident_slots_ > 0 && resident_promotions_ > 0 && !in_warmup);
   if (track_resident_scores) {
     std::fill(work.expert_invocation_rows.begin(), work.expert_invocation_rows.end(), uint8_t{0});

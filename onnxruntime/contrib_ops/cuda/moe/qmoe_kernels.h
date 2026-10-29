@@ -658,6 +658,12 @@ struct Int3Projection {
   int bits = 0;
 };
 
+struct Int3ExpertTileDesc {
+  int expert;
+  int start_idx;
+  int count;
+};
+
 struct Int3MoeParams {
   int tensor_core_min_routes = 33;  // 0 disables the tensor-core decode path.
   const void* input = nullptr;

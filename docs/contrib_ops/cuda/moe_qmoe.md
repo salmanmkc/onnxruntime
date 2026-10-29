@@ -222,7 +222,7 @@ QMoE when all of the following are true:
 - weights are INT4 or INT8 for per-column scales, or INT4/INT8 for symmetric block-wise scales;
 - `block_size <= 0` for per-column INT4/INT8, or `block_size` is 32, 64, or 128 for block-wise INT4/INT8;
 - block-wise GEMV is symmetric only; if zero-point compensation is present, dispatch falls back to grouped GEMM;
-- `expanded_num_rows = num_tokens * top_k` is in `(0, 8]`;
+- `expanded_num_rows = num_tokens * top_k` is in `(0, 80]`;
 - `N >= 512` and `K >= 512`;
 - if `expanded_num_rows > 4`, the logical MoE intermediate size is at least 512;
 - `N` is divisible by the column-interleaved tile width (32 for INT4, 16 for INT8),
@@ -237,6 +237,43 @@ shows comparable latency.
 Set `ORT_DISABLE_MOE_GEMV=1` before process start to force the grouped GEMM
 fallback for debugging, benchmarking, or bisecting numerical differences. The
 switch is cached on first use.
+
+**BF16 INT4 tensor-core GEMV.** For BF16 activations, INT4 weights and
+`block_size = 32`, `launch_moe_gemv_int_symmetric` and
+`launch_moe_gemv_int_symmetric_interleaved_swiglu` first try the kernels in
+[moe_gemv_tc.cuh](onnxruntime/contrib_ops/cuda/llm/moe_gemm/moe_gemv_tc.cuh)
+once `expanded_num_rows >= 33`. The scalar kernel dequantizes every weight once
+per routed row, so it is instruction-issue bound when a multi-token step such as
+`S = 8` with top-10 routing (80 rows) spreads over 16-25 experts. In the
+tensor-core kernel the weights are the A operand of `mma.sync.m16n8k16` and up
+to 8 consecutive rows of one expert are its N side, so those rows share every
+dequantized weight tile. It needs SM80+, `hidden % 512 == 0` and
+`inter % 128 == 0`; other shapes and row counts keep the scalar kernel. Every
+weight is still rounded to BF16 individually, so the results differ from the
+scalar kernel only by the FP32 accumulation order (about one BF16 ulp).
+The K loop is software pipelined: the packed weights and scales of step `s + 1` are
+already in registers while step `s` is computed, and lanes without a route read the
+activations of the last route so that every load is unconditional. The loop is
+deliberately not peeled: `__launch_bounds__` carries the occupancy target (5, 6 or 9
+CTAs per SM for 4, 2 or 1 m-blocks per warp), and peeling or carrying the activation
+registers over the loop makes `ptxas` allocate more registers and lose a resident CTA.
+FC2 uses one warp per 16 columns over the whole K. The summation order is unchanged, so
+the pipelined kernels are bit-identical to the unpipelined ones. With 80 routes over 29
+experts (L2 flushed, launch overhead of about 5.5 µs included) FC1 takes 23.2 µs
+instead of 29.2 µs and FC2 16.1 µs instead of 19.0 µs, which shortens an all-INT4
+decode cycle by about 2%.
+`ORT_DISABLE_MOE_GEMV_TC=1` disables the kernels and `ORT_MOE_GEMV_TC_MIN_ROWS`
+(default `33`) moves the row threshold. Session options `ep.cuda.disable_moe_gemv_tc`
+and `ep.cuda.moe_gemv_tc_min_rows` take precedence. The disable flag accepts `0` or `1`,
+and the threshold must be positive. Both are read once during QMoE kernel construction.
+The selected specialization must have a loaded PTX target of SM80+; lower-target PTX
+uses scalar GEMV even on newer devices. On the
+Qwen3.8-Flash-Next `S = 8` decode (H200, 2K context) a cycle is 15% shorter for
+the all-INT4 package and 5% and 2.3% shorter for the two INT3-mixed packages.
+`QMoETest_Bf16Int4TensorCoreGemvParity` in
+[moe_test.cc](onnxruntime/test/contrib_ops/moe_test.cc) compares 12 tokens with
+top-4 routing against a host reference that rounds every dequantized weight to
+BF16 and accumulates in FP32.
 
 ### 4.1 Per-mode dispatch matrix
 
@@ -535,6 +572,8 @@ For MXFP4, the block size is fixed at **32** by the format.
     - **Single-CTA fused routing + paired-first expert route grouping**: `FusedInt3SoftmaxTopKGroupsKernel<T, K>` ([qmoe_fused_route.cuh](onnxruntime/contrib_ops/cuda/moe/qmoe_fused_route.cuh)) for `1 <= rows <= 8, num_experts == 512, k <= 16` (and `BuildInt3RouteGroupsPairedFirstKernel` for general `routes <= 256`) computes `SoftmaxTopK` in registers (bit-identical to `SoftmaxTopKMergeKernel<T, 128, 4>`) and packs `int2 route_groups` placing 2-route shared-expert pairs `(r0, r1)` ahead of singletons `(r0, -1)` so paired routes load and unpack expert weights once for both tokens without tail-wave stragglers. Only the vectorized GEMV kernels below consume `route_groups`, so the groups are built only when `SelectInt3DecodeKernel` ([qmoe_kernels.h](onnxruntime/contrib_ops/cuda/moe/qmoe_kernels.h)) selects them; the scalar and non-vectorized fast fallbacks (for example `hidden = 128`, explicit zero points, or misaligned operands) skip the group build and use the plain `SoftmaxTopK` route arrays.
     - **Vectorized decode GEMV kernels**: `FusedFc1FastVecKernel<T, Bits, BlockSize>` (`__launch_bounds__(128, 7)`, 4 output columns / 8 weight rows per warp, upfront 8-row weight & scale `__ldg` pipelining, compile-time `BlockSize` in `{32, 64, 128}`, compact `T` shared-memory staging for up to 2 routes) and `Fc2RouteFastVecKernel<T, Bits, BlockSize>` (`__launch_bounds__(128, 6)`, 4 output columns per 16-lane half-warp, `#pragma unroll 5` for `intermediate = 640`, upfront 4-row weight & scale `__ldg` pipelining), with fallback to `FusedFc1FastKernel` / `Fc2RouteFastKernel` when alignment or shape constraints are not met.
     - **Branchless non-divergent 3-bit unpacking + IEEE-754 mantissa `lop3.b32` + `FADD` dequantization**: `AlignPackedCodeWord<3>` uses `__shfl_down_sync(0xffffffffu, w0, 1)` + `__funnelshift_r(w0, w1, bit_shift)` so every lane issues one unconditional `uint32_t` `__ldg` with zero warp divergence, and `Unpack8CenteredCodesFromWord<Bits>` (`Bits` in `{2, 3, 4}`) extracts 8 centered FP32 codes via `lop3.b32` + `FADD` without `I2F` instructions.
+    - **Packed bf16x2 dequantization for BF16 (`DequantizeInt3x8Bf16`)**: for BF16 activations the vectorized GEMV kernels produce two weights (codes `j` and `j + 4`) per 32-bit register with one `lop3.b32` that places each code in the mantissa of an exactly representable bf16 (`8 + code` and `128 + code`), one `HSUB2` that centers them and one `HMUL2` by the scale. The single bf16 rounding of the exact product equals the per-weight rounding of the FP32 path, so the outputs are bit-identical to the previous chain (about 6 instructions per weight, including `F2F.BF16`). FP16, INT2, and INT4 keep that chain.
+    - **Tensor-core decode GEMV for BF16 (`int3_tc::TryLaunchBf16`)** ([qmoe_int3_tc.cuh](onnxruntime/contrib_ops/cuda/moe/qmoe_int3_tc.cuh)): tried first on the vectorized decode path when FC1 and FC2 are both 3-bit with `block_size = 64`, there are no `router_weights` or zero points, `33 <= routes <= 256` (`ORT_QMOE_INT3_TC_MIN_ROUTES`, default `33`), `hidden % 512 == 0`, `intermediate % 128 == 0`, `hidden <= 3072`, `intermediate <= 3072` (the staged activations take `16 * hidden` B for FC1 and `16 * intermediate` B for FC2, at most 48 KB), the weights are 16-byte aligned, the scales are 4-byte aligned, and `sm >= 80`; otherwise `FusedFc1FastVecKernel` and `Fc2RouteFastVecKernel` run. It therefore serves multi-token steps below the prefill threshold, for example 8 tokens with top-10 routing. The weights are the A operand of `mma.sync.m16n8k16` and up to 8 routes of one expert are its N side, so every dequantized weight is used by all of them. Every warp owns whole-K m-blocks (FC1: 4 warps x 2 m-blocks = 128 rows per CTA, FC2: 4 warps x 1 m-block = 64 rows), so there is no cross-warp K split, no shared-memory reduction and no barrier, and the dynamic shared memory holds only the staged activations (`hidden * 16` B for FC1, `intermediate * 16` B for FC2, at most 48 KB). The kernel is one rolled loop over (m-block, 512-wide super-step) items that requests the weights and scales of the next item (two register sets) before it computes the current one; a compile-time unrolled window does not work, because `ptxas` hoists every independent load of a basic block to its top and spills, and only a real loop back edge keeps the prefetch distance (FC1: 116 registers, 3 CTAs per SM). Super-step `s` accumulates into the FP32 partition `s % 5` and the partitions are added in partition order, which reproduces the numerics of a cross-warp K split exactly. Dequantization is one `and` and one `fma.rn.bf16x2` per pair of codes: the 3-bit codes are masked into the mantissas of subnormal bf16 values, so one fused multiply-add gives `(code - 4) * scale * 2^-60` with a single rounding, which is the exact `(code - 4) * scale` rounded once and scaled by a power of two, and `finalize()` multiplies the FP32 accumulators by `2^60` again. The multiplier `scale * 2^73` must be finite and the smallest weight `scale * 2^-60` must be a normal bf16 number, so the kernel is exact for block scales in `[2^-66, 2^55)` and for zero, far wider than the scales of real models (about `2^-13..2^0`); a model with scales outside that range needs `ep.cuda.disable_qmoe_int3_tc=1`. Per-weight bf16 rounding is kept and only the FP32 accumulation order differs from the vectorized kernels (about one bf16 ulp). `ORT_DISABLE_QMOE_INT3_TC=1` (session option `ep.cuda.disable_qmoe_int3_tc`) disables it. Session option `ep.cuda.qmoe_int3_tc_min_routes` overrides the route threshold; it must be positive. The disable flag accepts `0` or `1`. Both settings are resolved once during kernel construction, with session options taking precedence. Both loaded FC1/FC2 specializations must target SM80+; lower-target PTX uses the vectorized fallback. Per layer at `S = 8` on an H200, the first version of the kernel (a K split over the warps of a CTA) took 43.1 µs for FC1 instead of 53.9 µs and 19.1 µs for FC2 instead of 33.6 µs for the vectorized kernels, which shortened a decode cycle of the INT3-mixed packages by 5-7%. The current kernel is bit-identical to that version: in a standalone harness (80 routes over 56 experts, L2 flushed, launch overhead of about 5.5 µs included) FC1 takes 30.4 µs instead of 49.1 µs and FC2 22.4 µs instead of 24.2 µs, and decode of the INT3-mixed packages is another 4.0-5.9% faster. `QMoETest_Bf16Int3TensorCoreGemvParity` in [moe_test.cc](onnxruntime/test/contrib_ops/moe_test.cc) checks it against a host reference (12 tokens with top-4 routing), and `QMoETest_Bf16TensorCoreGemvExtremeScales` repeats the check with FC1 block scales near `2^33` and FC2 block scales near `2^-47`, and the mirror image.
     - **Vectorized route reduction**: `FinalizeRoutesVec8Kernel<T>` uses 128-bit `uint4` loads and stores to reduce 8 columns per thread across `top_k` routes.
   - **Prefill path (`rows >= 16`, configurable via `ORT_INT3_PREFILL_MIN_ROWS`)**:
     - **Active-expert on-the-fly SM80 `fpA_intB` `uint4b_t` repack + CUTLASS Tensor Core grouped GEMM (`RunInt2MoePrefill`)**: when `sm >= 80`, `num_experts <= 512`, `hidden % 64 == 0`, `intermediate % 64 == 0`, `block_size` in `{32, 64, 128}`, and symmetric weights without `router_weights` or sparse mixer are used, `RepackRawIntToSm80Int4ActiveExpertsKernel<SrcBits>` (`SrcBits` in `{2, 3, 4}`, mapping centered 3-bit unsigned codes `u3 in [0, 7]` to unsigned 4-bit nibbles `u4 = u3 + 4 in [4, 11]` via `0x44444444u` nibble bias and permuting 12 contiguous INT3 bytes into 16 contiguous `uint4` SM80 `fpA_intB` bytes) and `TransposeScalesActiveExpertsKernel<T>` (`[E, N, K_blocks] -> [E, K_blocks, N]`) repack only active experts (`expert_offsets[e + 1] > expert_offsets[e]`, skipping inactive experts in 0 cycles) into a single reusable scratch buffer across FC1 and FC2 before running CUTLASS `MoeGemmRunner<T, cutlass::uint4b_t, T>`.
